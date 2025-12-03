@@ -34,42 +34,59 @@ DS_DICT = {
     "zsre": (MENDQADataset, compute_rewrite_quality_zsre),
 }
 
+
 # ----------------------------------------------------------------------
-# Fix target strings for ROME
+# Functions to guarantee ZSRE fields exist
 # ----------------------------------------------------------------------
-def fix_target_string(s: str) -> str:
-    """Ensures ROME receives a non-empty string starting with a space."""
-    if s is None:
-        return " UNKNOWN"
-    s = str(s).strip()
-    if len(s) == 0:
-        return " UNKNOWN"
-    if not s.startswith(" "):
-        s = " " + s
-    return s
+
+def ensure_target_has_space(target_str):
+    """ROME requires the target string to begin with a space."""
+    if not isinstance(target_str, str) or len(target_str.strip()) == 0:
+        return " <empty>"
+    if not target_str.startswith(" "):
+        return " " + target_str
+    return target_str
 
 
-def build_requested_rewrite_if_missing(record):
-    """Ensure record has a valid ROME-style 'requested_rewrite'."""
+def build_requested_rewrite(record):
+    """Ensure ZSRE fields exist even for custom multilingual data."""
+    if "src" not in record or "answers" not in record:
+        raise ValueError("ZSRE record missing src or answers fields")
+
+    subject = record.get("subject", "ENTITY")
+    answer = ensure_target_has_space(record["answers"][0])
+
+    return {
+        "prompt": record["src"].replace(subject, "{}"),
+        "subject": subject,
+        "target_new": {"str": answer},
+        "target_true": {"str": "<|endoftext|>"},
+    }
+
+
+def ensure_zsre_record(record):
+    """Ensures paraphrase_prompts and neighborhood_prompts exist."""
+    # Requested rewrite
     if "requested_rewrite" not in record:
-        subject = record.get("subject", "ENTITY")
-        answers = record.get("answers", ["UNKNOWN"])
-        target = fix_target_string(answers[0])
+        record["requested_rewrite"] = build_requested_rewrite(record)
 
-        record["requested_rewrite"] = {
-            "prompt": record["src"].replace(subject, "{}"),
-            "subject": subject,
-            "target_new": {"str": target},
-            "target_true": {"str": "<|endoftext|>"},
-        }
-    else:
-        # Ensure valid target string
-        record["requested_rewrite"]["target_new"]["str"] = fix_target_string(
-            record["requested_rewrite"]["target_new"]["str"]
-        )
+    # Paraphrase fallback
+    if "paraphrase_prompts" not in record:
+        record["paraphrase_prompts"] = [record["src"]]
+
+    # Neighborhood fallback
+    if "neighborhood_prompts" not in record:
+        record["neighborhood_prompts"] = [{
+            "prompt": record["src"],
+            "target": record["answers"][0],
+        }]
 
     return record
 
+
+# ======================================================================
+# MAIN
+# ======================================================================
 
 def main(
     alg_name: str,
@@ -85,35 +102,37 @@ def main(
     test_path: str,
     save_model_dir: str,
 ):
-
     # ==========================================================
-    # Create run directory
+    # RUN DIRECTORY
     # ==========================================================
-    params_class, apply_algo = ALG_DICT[alg_name]
-
     run_dir = Path("ROME_test_results/results")
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[INFO] Results stored at: {run_dir}")
+    print(f"[INFO] Results will be stored at: {run_dir}")
 
     # ==========================================================
-    # Load hyperparameters
+    # Load hparams
     # ==========================================================
+    params_class, apply_algo = ALG_DICT[alg_name]
     params_path = HPARAMS_DIR / alg_name / hparams_fname
     hparams = params_class.from_json(params_path)
-    print(f"[INFO] Loaded hparams: {params_path}")
+
+    print(f"[INFO] Using hyperparameters from: {params_path}")
 
     # ==========================================================
     # Load model
     # ==========================================================
     print("[INFO] Loading model...")
 
-    if isinstance(model_name, str):
+    if os.path.exists(save_model_dir):
+        print(f"[INFO] Loading SAVED English-edited model from: {save_model_dir}")
+        model = AutoModelForCausalLM.from_pretrained(save_model_dir).cuda()
+        tok = AutoTokenizer.from_pretrained(save_model_dir)
+    else:
+        print(f"[INFO] Loading fresh model: {model_name}")
         model = AutoModelForCausalLM.from_pretrained(model_name).cuda()
         tok = AutoTokenizer.from_pretrained(model_name)
-        tok.pad_token = tok.eos_token
-    else:
-        model, tok = model_name
+
+    tok.pad_token = tok.eos_token
 
     # ==========================================================
     # Load datasets
@@ -126,69 +145,65 @@ def main(
     with open(test_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
-    # Limit train set = exactly N samples
     train_data = train_data[:dataset_size_limit]
 
     print(f"[INFO] Loaded {len(train_data)} training samples")
     print(f"[INFO] Loaded {len(test_data)} test samples")
 
     # ==========================================================
-    # TRAINING PHASE
+    # TRAINING PHASE (only if model not already saved)
     # ==========================================================
-    print("\n===== TRAINING =====\n")
+    if not os.path.exists(save_model_dir):
+        print("\n===== TRAINING (English) =====\n")
 
-    for idx, record in enumerate(train_data):
-        print(f"[TRAIN] Editing case {idx}")
+        for idx, record in enumerate(train_data):
+            print(f"[TRAIN] Editing case {idx}")
 
-        record = build_requested_rewrite_if_missing(record)
+            record = ensure_zsre_record(record)
+            request = record["requested_rewrite"]
 
-        start = time()
+            start = time()
 
-        edited_model, weights_copy = apply_algo(
-            model,
-            tok,
-            [record["requested_rewrite"]],
-            hparams,
-            copy=False,
-            return_orig_weights=True,
-        )
+            edited_model, weights_copy = apply_algo(
+                model,
+                tok,
+                [request],
+                hparams,
+                copy=False,
+                return_orig_weights=True
+            )
 
-        print(f"[TRAIN] Edit time: {time() - start:.2f}s")
-        model = edited_model
+            model = edited_model
+            print(f"[TRAIN] Done in {time() - start:.2f}s")
 
-    # ==========================================================
-    # SAVE TRAINED MODEL
-    # ==========================================================
-    if save_model_dir:
-        print(f"[INFO] Saving edited model → {save_model_dir}")
-        os.makedirs(save_model_dir, exist_ok=True)
+        print(f"[INFO] Saving edited English model to: {save_model_dir}")
+        Path(save_model_dir).mkdir(parents=True, exist_ok=True)
         model.save_pretrained(save_model_dir)
         tok.save_pretrained(save_model_dir)
-        print("[INFO] Model saved.\n")
+    else:
+        print("[INFO] Skipping training — pre-edited English model already exists.")
 
     # ==========================================================
-    # TESTING PHASE
+    # TESTING PHASE (French)
     # ==========================================================
-    print("\n===== TESTING =====\n")
+    print("\n===== TESTING (French) =====\n")
 
     _, ds_eval_method = DS_DICT[ds_name]
 
     for record in test_data:
-        record = build_requested_rewrite_if_missing(record)
+        record = ensure_zsre_record(record)
         case_id = record.get("case_id", "unknown")
 
         print(f"[TEST] Case {case_id}")
 
-        metrics = {
-            "case_id": case_id,
-            "requested_rewrite": record["requested_rewrite"],
-            "post": ds_eval_method(model, tok, record, None, None),
-        }
+        result = ds_eval_method(model, tok, record, None, None)
 
-        with open(run_dir / f"case_{case_id}.json", "w") as f:
-            json.dump(metrics, f, indent=1)
+        # Save results
+        out_file = run_dir / f"case_{case_id}.json"
+        with open(out_file, "w") as f:
+            json.dump(result, f, indent=1)
 
-    print("\n===== DONE — ALL TEST RESULTS SAVED =====\n")
+    print("\n===== ALL TEST RESULTS SAVED =====\n")
 
 
 if __name__ == "__main__":
