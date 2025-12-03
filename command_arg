@@ -1,0 +1,12 @@
+#20 points wikibio - english
+
+!python3 -m experiments.evaluate\
+    --alg_name ROME \
+    --model_name gpt2-xl \
+    --hparams_fname GPT-XL2_wikibio.json \
+    --ds_name wikibio \
+    --dataset_size_limit 20 \
+    --config_path /content/ROME-main/rome-main/config/wikibio_config_full.json \
+    --train_path /content/ROME-main/rome-main/dataset/dataset/WikiBio/ENG/wikibio-train-all.json \
+    --test_path /content/ROME-main/rome-main/dataset/dataset/WikiBio/ENG/wikibio-test-all.json \
+    --save_model_dir ROME_MODELS/GPT-XL2_wikibio_edited
