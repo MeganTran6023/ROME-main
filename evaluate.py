@@ -80,11 +80,15 @@ def main(
         assert run_dir.exists(), "Continue run does not exist!"
     else:
         alg_dir = RESULTS_DIR / dir_name
-        ids = [
-            int(str(x).split("_")[-1])
-            for x in alg_dir.iterdir()
-            if str(x).split("_")[-1].isnumeric()
-        ] if alg_dir.exists() else []
+        ids = (
+            [
+                int(str(x).split("_")[-1])
+                for x in alg_dir.iterdir()
+                if str(x).split("_")[-1].isnumeric()
+            ]
+            if alg_dir.exists()
+            else []
+        )
         run_id = max(ids) + 1 if ids else 0
         run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +99,8 @@ def main(
 
     # Load hyperparams
     params_path = (
-        run_dir / "params.json" if continue_from_run
+        run_dir / "params.json"
+        if continue_from_run
         else HPARAMS_DIR / alg_name / hparams_fname
     )
     with open(params_path) as f:
@@ -123,7 +128,9 @@ def main(
     # Load data
     snips = AttributeSnippets(DATA_DIR) if not skip_generation_tests else None
     vec = get_tfidf_vectorizer(DATA_DIR) if not skip_generation_tests else None
-    ds, ds_eval_method = load_dataset(ds_name, train_path, test_path, tok, dataset_size_limit)
+    ds, ds_eval_method = load_dataset(
+        ds_name, train_path, test_path, tok, dataset_size_limit
+    )
 
     for record in ds:
         case_id = record["case_id"]
@@ -131,18 +138,35 @@ def main(
         if out_path.exists():
             continue
 
-        # Build rewrite request
+        # Build ROME-compatible rewrite request
+        prompt = record["text"]
+        subject = record["concept"]
+        target_str = record["labels"]
+
+        # Ensure subject appears in prompt (helps ROME find edit location)
+        if subject and subject not in prompt:
+            prompt = f"{subject}. {prompt}"
+
         requested_rewrite = {
-            "prompt": record["text"],
-            "target_new": record["labels"],
-            "subject": record["concept"],
+            "prompt": prompt,
+            "subject": subject,
+            "target_new": {
+                "str": target_str,
+                "loc": subject,
+            },
         }
-        print(f"\n➡️ Editing case {case_id} — {record['concept']}")
+
+        print(f"\n➡️ Editing case {case_id} — {subject}")
         start = time()
         mem_args = dict(return_orig_weights_device="cpu") if conserve_memory else {}
         edited_model, weights_copy = apply_algo(
-            model, tok, [requested_rewrite], hparams,
-            copy=False, return_orig_weights=True, **mem_args
+            model,
+            tok,
+            [requested_rewrite],
+            hparams,
+            copy=False,
+            return_orig_weights=True,
+            **mem_args,
         )
         exec_time = time() - start
         print(f"Edit time: {exec_time:.1f}s")
@@ -175,6 +199,7 @@ def main(
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--alg_name", choices=["ROME", "FT", "KN", "MEND"], required=True)
@@ -194,9 +219,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(
-        args.alg_name, args.model_name, args.hparams_fname, args.ds_name,
-        args.dataset_size_limit, args.continue_from_run,
-        args.skip_generation_tests, args.conserve_memory,
+        args.alg_name,
+        args.model_name,
+        args.hparams_fname,
+        args.ds_name,
+        args.dataset_size_limit,
+        args.continue_from_run,
+        args.skip_generation_tests,
+        args.conserve_memory,
         dir_name=args.alg_name,
         config_path=args.config_path,
         train_path=args.train_path,
